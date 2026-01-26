@@ -1,4 +1,5 @@
 import jax
+from jax import jit
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -6,21 +7,30 @@ from flowjax.distributions import Normal
 from flowjax.flows import block_neural_autoregressive_flow
 from flowjax.train import fit_to_data
 
+import os
+import json
+from pathlib import Path
+
+import equinox as eqx
+
 
 class FlowSurface:
-    def __init__(self, x, alpha, seed=187):
-        """
-        x:      (N, x_dim)      event observables
-        alpha:  (N, alpha_dim)  detector parameters
-        """
+    def __init__(self, x, alpha, seed=187, **flow_kwargs):
         rng = jr.key(seed)
 
-        # build conditional flow
+        default_flow_kwargs = dict(
+            nn_depth=1,
+            nn_block_dim=4,
+            flow_layers=1,
+        )
+        flow_kwargs = {**default_flow_kwargs, **flow_kwargs}
+
         rng, sub = jr.split(rng)
         flow = block_neural_autoregressive_flow(
             key=sub,
-            base_dist=Normal(jnp.zeros(x.shape[1])),   # x_dim
-            cond_dim=alpha.shape[1],                   # alpha_dim
+            base_dist=Normal(jnp.zeros(x.shape[1])),
+            cond_dim=alpha.shape[1],
+            **flow_kwargs,
         )
 
         self.flow = flow
@@ -29,7 +39,12 @@ class FlowSurface:
         self.alpha_train = alpha
         self.losses = None
 
-    def train_flow(self, learning_rate=5e-2, max_patience=10):
+        # store for save/load
+        self._x_dim = int(x.shape[1])
+        self._alpha_dim = int(alpha.shape[1])
+        self._flow_kwargs = dict(flow_kwargs)
+
+    def train_flow(self, learning_rate=5e-2, max_epochs=100,max_patience=10,batch_size=65536):
         rng, sub = jr.split(self.rng)
         flow, losses = fit_to_data(
             sub,
@@ -37,6 +52,8 @@ class FlowSurface:
             data=(self.x_train, self.alpha_train),   # (x, cond)
             learning_rate=learning_rate,
             max_patience=max_patience,
+            max_epochs=max_epochs,
+            batch_size=batch_size,
         )
         self.flow = flow
         self.losses = losses
@@ -137,3 +154,69 @@ class FlowSurface:
 
         logw = jnp.clip(logw, -clip_logw, clip_logw)
         return jnp.exp(logw)
+    
+
+    # -------------------------
+    # Save / Load
+    # -------------------------
+    def save(self, path):
+        """Save flow + metadata to a directory."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        meta = dict(
+            x_dim=self._x_dim,
+            alpha_dim=self._alpha_dim,
+            flow_kwargs=self._flow_kwargs,
+        )
+        (path / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        # saves all array leaves of the pytree
+        eqx.tree_serialise_leaves(path / "flow.eqx", self.flow)
+
+        # optional: save losses if present
+        if self.losses is not None:
+            import numpy as np
+            np.save(path / "losses.npy", np.asarray(self.losses))
+
+    @classmethod
+    def load(cls, path, seed=187):
+        """Load flow + metadata from a directory. Training data is not restored."""
+        path = Path(path)
+
+        meta = json.loads((path / "meta.json").read_text())
+        x_dim = int(meta["x_dim"])
+        alpha_dim = int(meta["alpha_dim"])
+        flow_kwargs = dict(meta["flow_kwargs"])
+
+        # reconstruct the exact same flow structure
+        rng = jr.key(seed)
+        rng, sub = jr.split(rng)
+        flow_template = block_neural_autoregressive_flow(
+            key=sub,
+            base_dist=Normal(jnp.zeros(x_dim)),
+            cond_dim=alpha_dim,
+            **flow_kwargs,
+        )
+
+        flow = eqx.tree_deserialise_leaves(path / "flow.eqx", flow_template)
+
+        # build instance without calling __init__
+        self = cls.__new__(cls)
+        self.flow = flow
+        self.rng = rng
+        self.x_train = None
+        self.alpha_train = None
+        self.losses = None
+
+        self._x_dim = x_dim
+        self._alpha_dim = alpha_dim
+        self._flow_kwargs = flow_kwargs
+
+        # optional: restore losses if present
+        losses_path = path / "losses.npy"
+        if losses_path.exists():
+            import numpy as np
+            self.losses = np.load(losses_path,allow_pickle=True)
+
+        return self
